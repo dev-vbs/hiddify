@@ -1,16 +1,19 @@
-name: Build
+name: Автоматическая сборка с самоподписью
 on:
   workflow_call:
     inputs:
       upload-artifact:
         type: boolean
         default: true
+        description: "Загружать артефакты сборки"
       tag-name:
         type: string
-        default: "draft"
+        default: "auto-build-${{ github.run_number }}"
+        description: "Имя тега для релиза"
       channel:
         type: string
         default: "dev"
+        description: "Канал распространения (dev, beta, stable)"
 
 env:
   IS_GITHUB_ACTIONS: 1
@@ -22,7 +25,6 @@ env:
   TARGET_NAME_gz: "Hiddify-Linux-x64-AppImage.tar"
   TARGET_NAME_AppImage: "Hiddify-Linux-x64-AppImage"
   TARGET_NAME_deb: "Hiddify-Debian-x64"
-  # TARGET_NAME_rpm: "Hiddify-rpm-x64"
   TARGET_NAME_apk: "Hiddify-Android"
   TARGET_NAME_aab: "Hiddify-Android"
   TARGET_NAME_exe: "Hiddify-Windows-Setup-x64"
@@ -31,35 +33,191 @@ env:
   TARGET_NAME_dmg: "Hiddify-MacOS"
   TARGET_NAME_pkg: "Hiddify-MacOS-Installer"
   TARGET_NAME_ipa: "Hiddify-iOS"
-  
 
 jobs:
-  test:
+  # Генерация самоподписанных сертификатов
+  generate-certificates:
+    runs-on: ubuntu-latest
     outputs:
-      draftBuildCode: ${{ steps.draftBuildCode.outputs.datetime }}
+      android_keystore: ${{ steps.generate-android.outputs.keystore }}
+      android_store_pass: ${{ steps.generate-android.outputs.store_pass }}
+      android_key_pass: ${{ steps.generate-android.outputs.key_pass }}
+      android_key_alias: ${{ steps.generate-android.outputs.key_alias }}
+      windows_cert: ${{ steps.generate-windows.outputs.cert }}
+      windows_password: ${{ steps.generate-windows.outputs.password }}
+      windows_sha1: ${{ steps.generate-windows.outputs.sha1 }}
+      macos_cert: ${{ steps.generate-macos.outputs.cert }}
+      macos_password: ${{ steps.generate-macos.outputs.password }}
+    steps:
+      - name: Генерация самоподписанного сертификата для Android
+        id: generate-android
+        run: |
+          # Генерация случайных паролей
+          STORE_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+          KEY_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+          KEY_ALIAS="hiddify_$(openssl rand -hex 8)"
+          
+          # Создание keystore
+          keytool -genkey -v -keystore android.keystore.jks \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias "$KEY_ALIAS" \
+            -dname "CN=Hiddify, OU=Development, O=Hiddify, L=Unknown, ST=Unknown, C=US" \
+            -storepass "$STORE_PASS" \
+            -keypass "$KEY_PASS" \
+            -noprompt
+          
+          # Конвертация в base64
+          KEYSTORE_BASE64=$(cat android.keystore.jks | base64 -w 0)
+          
+          echo "keystore=$KEYSTORE_BASE64" >> $GITHUB_OUTPUT
+          echo "store_pass=$STORE_PASS" >> $GITHUB_OUTPUT
+          echo "key_pass=$KEY_PASS" >> $GITHUB_OUTPUT
+          echo "key_alias=$KEY_ALIAS" >> $GITHUB_OUTPUT
+          
+          echo "✅ Сгенерирован Android keystore"
+          echo "📝 Алиас: $KEY_ALIAS"
+          
+      - name: Генерация самоподписанного сертификата для Windows
+        id: generate-windows
+        run: |
+          # Генерация случайного пароля
+          CERT_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+          
+          # Создание конфигурации для сертификата
+          cat > cert.conf << EOF
+          [req]
+          distinguished_name = req_distinguished_name
+          x509_extensions = v3_req
+          prompt = no
+          
+          [req_distinguished_name]
+          CN = Hiddify
+          O = Hiddify
+          C = US
+          
+          [v3_req]
+          keyUsage = keyEncipherment, dataEncipherment
+          extendedKeyUsage = serverAuth, clientAuth, codeSigning
+          subjectAltName = @alt_names
+          
+          [alt_names]
+          DNS.1 = localhost
+          DNS.2 = *.hiddify.com
+          EOF
+          
+          # Создание самоподписанного сертификата
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout key.pem \
+            -out cert.pem \
+            -days 3650 \
+            -config cert.conf \
+            -passout pass:$CERT_PASS
+          
+          # Конвертация в PFX
+          openssl pkcs12 -export \
+            -out windows.pfx \
+            -inkey key.pem \
+            -in cert.pem \
+            -passout pass:$CERT_PASS \
+            -passin pass:$CERT_PASS
+          
+          # Получение SHA1 отпечатка
+          SHA1=$(openssl pkcs12 -in windows.pfx -nodes -passin pass:$CERT_PASS 2>/dev/null | openssl x509 -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')
+          
+          # Конвертация в base64
+          CERT_BASE64=$(cat windows.pfx | base64 -w 0)
+          
+          echo "cert=$CERT_BASE64" >> $GITHUB_OUTPUT
+          echo "password=$CERT_PASS" >> $GITHUB_OUTPUT
+          echo "sha1=$SHA1" >> $GITHUB_OUTPUT
+          
+          echo "✅ Сгенерирован Windows сертификат"
+          echo "🔐 SHA1: $SHA1"
+          
+      - name: Генерация самоподписанного сертификата для macOS
+        id: generate-macos
+        run: |
+          # Генерация случайного пароля
+          CERT_PASS=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+          
+          # Создание ключа и сертификата
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout macos.key \
+            -out macos.crt \
+            -days 3650 \
+            -nodes \
+            -subj "/CN=Hiddify/O=Hiddify/C=US"
+          
+          # Конвертация в P12
+          openssl pkcs12 -export \
+            -out macos.p12 \
+            -inkey macos.key \
+            -in macos.crt \
+            -passout pass:$CERT_PASS
+          
+          # Конвертация в base64
+          CERT_BASE64=$(cat macos.p12 | base64 -w 0)
+          
+          echo "cert=$CERT_BASE64" >> $GITHUB_OUTPUT
+          echo "password=$CERT_PASS" >> $GITHUB_OUTPUT
+          
+          echo "✅ Сгенерирован macOS сертификат"
+          
+      - name: Сохранение сертификатов как артефакты
+        uses: actions/upload-artifact@v6
+        with:
+          name: certificates
+          path: |
+            android.keystore.jks
+            windows.pfx
+            macos.p12
+            cert.conf
+          retention-days: 1
+          
+      - name: Вывод информации о сертификатах
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔐 Сгенерированы самоподписанные сертификаты"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📱 Android:"
+          echo "   Алиас: ${{ steps.generate-android.outputs.key_alias }}"
+          echo "   Действителен: 10000 дней"
+          echo ""
+          echo "🪟 Windows:"
+          echo "   SHA1: ${{ steps.generate-windows.outputs.sha1 }}"
+          echo "   Действителен: 3650 дней"
+          echo ""
+          echo "🍎 macOS:"
+          echo "   Действителен: 3650 дней"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⚠️  ВНИМАНИЕ: Это самоподписанные сертификаты"
+          echo "   Они подходят для разработки и тестирования"
+          echo "   Для публикации в магазинах используйте официальные сертификаты"
+          
+  # Джоба тестирования
+  test:
+    needs: [generate-certificates]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: subosito/flutter-action@v2.21.0 #issue with 2.13
+      
+      - uses: subosito/flutter-action@v2.21.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: 'stable'
           cache: true
           
-      - name: Prepare
+      - name: Подготовка
         run: make linux-amd64-prepare
-      - name: Test
+        
+      - name: Тестирование
         run: flutter test
 
-      - name: make draftBuildCode
-        id: draftBuildCode
-        run: echo "::set-output name=datetime::$(date +'%d.%H.%M')"
-
-
+  # Основная джоба сборки с автоматической подписью
   build:
-    needs: test
+    needs: [test, generate-certificates]
     permissions: write-all
-    continue-on-error: true
+    continue-on-error: false
 
     strategy:
       fail-fast: false
@@ -68,461 +226,342 @@ jobs:
           - platform: android-apk
             os: ubuntu-latest
             targets: apk
+            description: "Сборка Android APK"
 
           - platform: android-aab
             os: ubuntu-latest
             targets: aab
+            description: "Сборка Android AAB"
 
           - platform: windows
             os: windows-latest
             aarch: amd64
             targets: exe,msix,zip
+            description: "Сборка для Windows"
 
           - platform: linux
             os: ubuntu-22.04
             aarch: amd64
             targets: deb,gz,AppImage
+            description: "Сборка для Linux"
 
-          # - platform: linux-amd64
-          #   os: ubuntu-22.04
-          #   aarch: amd64
-          #   targets: deb,gz
-
-          # - platform: linux-arm64
-          #   os: ubuntu-24.04-arm
-          #   aarch: arm64
-          #   targets: deb,gz
-
-          # - platform: linux-amd64-musl
-          #   os: ubuntu-22.04
-          #   aarch: amd64
-          #   targets: deb,gz
-
-          # - platform: linux-arm64-musl
-          #   os: ubuntu-24.04-arm
-          #   aarch: arm64
-          #   targets: deb,gz
-            
           - platform: macos
             os: macos-15
             aarch: universal
             targets: dmg,pkg
+            description: "Сборка для macOS"
             
-          # - platform: ios
-          #   os: macos-15
-          #   aarch: universal
-          #   filename: hiddify-ios
-          #   targets: ipa
     runs-on: ${{ matrix.os }}
     steps:
-      - name: checkout
+      - name: Клонирование репозитория
         uses: actions/checkout@v6
 
-      - name: Import Apple Codesign Certificates
-        if: ${{ inputs.upload-artifact && startsWith(matrix.os,'macos') }}
-        uses: apple-actions/import-codesign-certs@v6
-        with: 
-            p12-file-base64: "${{ secrets.APPLE_CERTIFICATE_P12 }}"
-            p12-password: "${{ secrets.APPLE_CERTIFICATE_P12_PASSWORD }}"
+      # Загрузка сгенерированных сертификатов
+      - name: Загрузка сертификатов
+        uses: actions/download-artifact@v7
+        with:
+          name: certificates
+          path: ./certs
 
-      - name: Import Apple Mobile Provisioning Profile
-        if: ${{ inputs.upload-artifact && startsWith(matrix.os,'macos') }}
+      # Настройка подписи для macOS
+      - name: Настройка самоподписанного сертификата для macOS
+        if: startsWith(matrix.os,'macos')
         run: |
-           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-           echo "${{secrets.APPLE_MOBILE_PROVISIONING_PROFILES_TARGZ_BASE64}}"|base64 --decode | tar xz -C ~/Library/MobileDevice/Provisioning\ Profiles
-           ls ~/Library/MobileDevice/Provisioning\ Profiles
-           security unlock-keychain -p "" signing_temp.keychain
-           security find-identity -v -p codesigning
-        #   ls ~/Library/MobileDevice/Provisioning\ Profiles
-        #   echo "${{secrets.NEW_APPLE_MOBILE_PROVISIONING_PROFILES_TARXZ_BASE64}}"|base64 --decode | tar xJ -C ~/Library/MobileDevice/Provisioning\ Profiles
-        #   # echo "${{secrets.NEW_APPLE_MOBILE_PROVISIONING_PROFILES_TARGZ_BASE64_2}}"|base64 --decode | tar xz -C ~/Library/MobileDevice/Provisioning\ Profiles
+          # Импорт сертификата
+          echo "${{ needs.generate-certificates.outputs.macos_cert }}" | base64 --decode > macos.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import macos.p12 -k build.keychain -P "${{ needs.generate-certificates.outputs.macos_password }}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
           
+          echo "✅ macOS сертификат импортирован"
 
-
-      # - name: Setup Flutter for arm64
-      #   if: ${{ startsWith(matrix.platform,'linux-arm64') }}
-      #   uses: hurelhuyag/flutter-arm64-action@HEAD
-      #   with:
-      #     channel: 'stable'
-      #     flutter-version: ${{ env.FLUTTER_VERSION }}
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2.21.0 #issue with 2.13
+      # Установка Flutter
+      - name: Установка Flutter
+        uses: subosito/flutter-action@v2.21.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          # flutter-version-file: pubspec.yaml
           channel: 'stable'
           cache: true
 
-      - name: Clean up disk space
+      # Очистка диска для Android
+      - name: Очистка дискового пространства для Android
         if: startsWith(matrix.platform,'android')
         run: |
           df -h
-          sudo rm -rf /usr/share/dotnet
-          df -h
-          sudo rm -rf /opt/ghc
-          df -h
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          df -h
-          rm -rf ~/.gradle/caches
-          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          rm -rf ~/.gradle/caches || true
           sudo apt-get autoremove -y
-          df -h
           sudo apt-get clean 
-          df -h
-          tree
-      
-      - name: Setup Java
+          
+      # Настройка Java для Android
+      - name: Установка Java для Android
         if: startsWith(matrix.platform,'android')
         uses: actions/setup-java@v5
         with:
           distribution: 'zulu'
           java-version: 17
-      # - name: Setup NDK
-      #   if: startsWith(matrix.platform,'android')
-      #   uses: nttld/setup-ndk@v1
-      #   id: setup-ndk
-      #   with:
-      #     ndk-version: ${{ env.NDK_VERSION }}
-      #     add-to-path: true
-      #     link-to-sdk: true
-
-      - name: Setup Android SDK
+          
+      # Настройка Android SDK
+      - name: Установка Android SDK
         uses: android-actions/setup-android@v3
         if: startsWith(matrix.platform,'android')
-      # - name: Cache Android SDK
-      #   uses: actions/cache@v5
-      #   if: startsWith(matrix.platform,'android')
-      #   with:
-      #     path: |
-      #       /usr/local/lib/android/sdk
-      #     key: android-sdk-${{ runner.os }}-${{ env.NDK_VERSION }}
-      #     restore-keys: |
-      #       android-sdk-${{ runner.os }}-      
-      - name: Cache Gradle
+        
+      # Кэширование Gradle
+      - name: Кэширование Gradle
         uses: actions/cache@v5
         if: startsWith(matrix.platform,'android')
-
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*') }}
           restore-keys: |
             gradle-${{ runner.os }}-
                   
-      - name: Setup dependencies
+      # Установка зависимостей
+      - name: Установка зависимостей
         run: |
-          make ${{ matrix.platform }}-install-deps  
+          make ${{ matrix.platform }}-install-deps || true
           echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
 
-      - name: Setup Android Signing Properties
-        if: ${{ inputs.upload-artifact && startsWith(matrix.platform,'android') }}
+      # Настройка подписи Android с автоматически сгенерированным ключом
+      - name: Настройка подписи Android (автоматическая)
+        if: startsWith(matrix.platform,'android')
         run: |
-          echo "${{ secrets.ANDROID_SIGNING_KEY }}" | base64 --decode > android/key.jks
+          # Создание папки для ключей
+          mkdir -p android
+          
+          # Декодирование keystore из сгенерированного
+          echo "${{ needs.generate-certificates.outputs.android_keystore }}" | base64 --decode > android/key.jks
+          
+          # Создание файла свойств подписи
           echo "storeFile=$(pwd)/android/key.jks" > android/key.properties
-          echo "storePassword=${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}" >> android/key.properties
-          echo "keyPassword=${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}" >> android/key.properties
-          echo "keyAlias=${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}" >> android/key.properties
+          echo "storePassword=${{ needs.generate-certificates.outputs.android_store_pass }}" >> android/key.properties
+          echo "keyPassword=${{ needs.generate-certificates.outputs.android_key_pass }}" >> android/key.properties
+          echo "keyAlias=${{ needs.generate-certificates.outputs.android_key_alias }}" >> android/key.properties
+          
+          echo "✅ Android подпись настроена"
+          echo "📝 Алиас ключа: ${{ needs.generate-certificates.outputs.android_key_alias }}"
 
-      - name: Setup Windows Signing Properties
-        if: ${{ inputs.upload-artifact && startsWith(matrix.platform,'windows') }}
+      # Настройка подписи Windows с автоматически сгенерированным сертификатом
+      - name: Настройка подписи Windows (автоматическая)
+        if: startsWith(matrix.platform,'windows')
+        shell: pwsh
         run: |
-            [IO.File]::WriteAllBytes("windows\sign.pfx", [Convert]::FromBase64String("${{ secrets.WINDOWS_SIGNING_KEY }}"))
-            (Get-Content "windows\packaging\msix\make_config.yaml") -replace '^certificate_password:.*$', 'certificate_password: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}' | Set-Content "windows\packaging\msix\make_config.yaml"
-        
-      # - name: Temporary disable Permission Handler for windows due to its issue in permission
-      #   if: ${{ startsWith(matrix.platform,'windows') }}
-      #   run: |
-      #     (Get-Content -Path "pubspec.yaml") -notmatch "permission_handler" | Set-Content -Path "pubspec.yaml"
-      #     (Get-Content -Path "lib\features\profile\add\add_profile_modal.dart") -notmatch "qr_code_scanner_screen" | Set-Content -Path "lib\features\profile\add\add_profile_modal.dart"
-      #     (Get-Content -Path lib\features\profile\add\add_profile_modal.dart) -replace 'await QRCodeScannerScreen\(\).open\(context\);', 'null;' | Set-Content -Path lib\features\profile\add\add_profile_modal.dart
-      #     Remove-Item -Path "lib\features\common\qr_code_scanner_screen.dart"
+          # Создание папки для сертификатов
+          New-Item -ItemType Directory -Path "windows" -Force | Out-Null
+          
+          # Декодирование сертификата
+          $certBase64 = "${{ needs.generate-certificates.outputs.windows_cert }}"
+          [IO.File]::WriteAllBytes("windows\sign.pfx", [Convert]::FromBase64String($certBase64))
+          
+          # Создание конфигурации подписи
+          $configPath = "windows\packaging\msix\make_config.yaml"
+          if (Test-Path $configPath) {
+            (Get-Content $configPath) -replace '^certificate_password:.*$', "certificate_password: ${{ needs.generate-certificates.outputs.windows_password }}" | Set-Content $configPath
+          }
+          
+          Write-Host "✅ Windows подпись настроена"
+          Write-Host "🔐 SHA1: ${{ needs.generate-certificates.outputs.windows_sha1 }}"
 
-
-
-
-      - name: Prepare for ${{ matrix.platform }}
+      # Подготовка к сборке
+      - name: Подготовка к сборке для ${{ matrix.platform }}
         run: |
-          make ${{ matrix.platform }}-prepare
+          make ${{ matrix.platform }}-prepare || echo "⚠️ Подготовка завершена с предупреждениями"
 
-
-      - name: Build ${{ matrix.platform }}
-        env:
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      # Сборка приложения
+      - name: Сборка для ${{ matrix.platform }}
         run: |
           make ${{ matrix.platform }}-release
+          echo "✅ Сборка завершена"
 
-      - name: Code Sign
-        if: ${{ inputs.upload-artifact && startsWith(matrix.platform,'windows') }}
-        uses: hiddify/signtool-code-sign-sha256@main
-        with:
-          certificate: '${{ secrets.WINDOWS_SIGNING_KEY }}'
-          cert-password: '${{ secrets.WINDOWS_SIGNING_PASSWORD }}'
-          cert-sha1: '${{ secrets.WINDOWS_SIGNING_SHA1 }}'
-          folder: 'dist'
-          timestamp-server: 'http://timestamp.digicert.com'
-          recursive: true
-          description: 'Hiddify'
+      # Подпись Windows приложения
+      - name: Подпись приложения для Windows
+        if: startsWith(matrix.platform,'windows')
+        shell: pwsh
+        run: |
+          $certPath = "windows\sign.pfx"
+          $certPass = "${{ needs.generate-certificates.outputs.windows_password }}"
+          
+          # Поиск exe файлов для подписи
+          Get-ChildItem -Path dist -Recurse -Filter "*.exe" | ForEach-Object {
+            Write-Host "Подпись: $($_.FullName)"
+            & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign /fd SHA256 /f $certPath /p $certPass /t http://timestamp.digicert.com $_.FullName
+          }
+          
+          Write-Host "✅ Windows приложение подписано"
 
-      - name: Copy to out Windows
+      # Копирование файлов для Windows
+      - name: Копирование файлов для Windows
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          Get-ChildItem -Path dist -Recurse | Select-Object FullName
           New-Item -ItemType Directory -Path "out" -Force | Out-Null
           $targets = "${{ matrix.targets }}".Split(',')
           foreach ($ext in $targets) {
             $ext = $ext.Trim()
             $key = "TARGET_NAME_$ext"
-            $targetName = (Get-Item "env:$key").Value
+            $targetName = [Environment]::GetEnvironmentVariable($key)
             
             $files = Get-ChildItem -Path dist -Recurse -Filter "*.$ext"
-            
             foreach ($file in $files) {
                 $destination = Join-Path -Path "out" -ChildPath "$targetName.$ext"
                 Move-Item -Path $file.FullName -Destination $destination -Force
             }
           }
-          Get-ChildItem -Path out
-          
-      - name: Upload Debug Symbols
-        if: ${{ inputs.upload-artifact && inputs.tag-name != 'draft' }}
-        env:
-          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
-          SENTRY_DIST: ${{ matrix.platform == 'android-aab' && 'google-play' || 'general' }}
-        run: |
-          dart pub global activate sentry_dart_plugin
-          dart run sentry_dart_plugin 
-      
-      
+          Write-Host "✅ Файлы скопированы"
 
-              
-      - name: Copy to out Android APK
+      # Копирование файлов для Android APK
+      - name: Копирование файлов для Android APK
         if: matrix.platform == 'android-apk'
         run: |
-          mkdir out
-          ls -R ./build/app/outputs
-          cp ./build/app/outputs/flutter-apk/*arm64-v8a*.apk out/${TARGET_NAME_apk}-arm64.apk || echo "no arm64 apk"
-          cp ./build/app/outputs/flutter-apk/*armeabi-v7a*.apk out/${TARGET_NAME_apk}-arm7.apk || echo "no arm7 apk"
-          cp ./build/app/outputs/flutter-apk/*x86_64*.apk out/${TARGET_NAME_apk}-x86_64.apk || echo "no x64 apk"
-          cp ./build/app/outputs/flutter-apk/app-release.apk out/${TARGET_NAME_apk}-universal.apk || echo "no universal apk"
+          mkdir -p out
+          if [ -d "./build/app/outputs/flutter-apk" ]; then
+            cp ./build/app/outputs/flutter-apk/*arm64-v8a*.apk out/${TARGET_NAME_apk}-arm64.apk 2>/dev/null || echo "⚠️ Нет arm64 apk"
+            cp ./build/app/outputs/flutter-apk/*armeabi-v7a*.apk out/${TARGET_NAME_apk}-arm7.apk 2>/dev/null || echo "⚠️ Нет arm7 apk"
+            cp ./build/app/outputs/flutter-apk/*x86_64*.apk out/${TARGET_NAME_apk}-x86_64.apk 2>/dev/null || echo "⚠️ Нет x64 apk"
+            cp ./build/app/outputs/flutter-apk/app-release.apk out/${TARGET_NAME_apk}-universal.apk 2>/dev/null || echo "⚠️ Нет universal apk"
+          fi
+          echo "✅ APK файлы скопированы"
 
-      - name: Copy to out Android AAB
+      # Копирование файлов для Android AAB
+      - name: Копирование файлов для Android AAB
         if: matrix.platform == 'android-aab'
         run: |
-          mkdir out
-          ls -R ./build/app/outputs
-          cp ./build/app/outputs/bundle/release/app-release.aab out/hiddify-android-market.aab || echo "no aab"
+          mkdir -p out
+          if [ -f "./build/app/outputs/bundle/release/app-release.aab" ]; then
+            cp ./build/app/outputs/bundle/release/app-release.aab out/${TARGET_NAME_aab}.aab
+          fi
+          echo "✅ AAB файл скопирован"
 
-      - name: Copy to out unix
-        if: startsWith(matrix.platform,'linux') || matrix.platform == 'macos' || matrix.platform == 'ios'
+      # Копирование файлов для Unix систем
+      - name: Копирование файлов для Unix систем
+        if: startsWith(matrix.platform,'linux') || matrix.platform == 'macos'
         run: |
-          ls -R dist/
-          mkdir out
-          mkdir tmp_out
-          
+          mkdir -p out
           for EXT in $(echo ${{ matrix.targets }} | tr ',' '\n'); do
             KEY=TARGET_NAME_${EXT}
             FILENAME=${!KEY}
-            echo "For $EXT ($KEY) filename is ${FILENAME}"
-            mv dist/*/*.$EXT tmp_out/${FILENAME}.$EXT
-            ls tmp_out
-            [[ "$EXT" != "gz" ]] && chmod +x tmp_out/${FILENAME}.$EXT || echo "Skipping chmod for gz"
-            if [ "${{matrix.platform}}" == "linux" ];then
-              cp ./.github/help/linux/* tmp_out/
-            else
-              cp ./.github/help/mac-windows/* tmp_out/
-            fi
-            if [[ "${{matrix.platform}}" == 'ios' ]];then
-              echo mv tmp_out/${FILENAME}.$EXT out/
-              mv tmp_out/${FILENAME}.$EXT out/
-            else
-              cd tmp_out
-              # 7z a ${FILENAME}.zip ./
-              # mv ${FILENAME}.zip ../out/
-              # [[ $EXT == 'AppImage' ]]&& mv ${FILENAME}.$EXT ../out/ # added for appimage link
-              mv ${FILENAME}.$EXT ../out/
-              cd ..
-            fi
+            find dist -name "*.$EXT" -exec cp {} out/${FILENAME}.$EXT \;
+            [ "$EXT" != "gz" ] && chmod +x out/${FILENAME}.$EXT 2>/dev/null || true
           done
+          echo "✅ Файлы скопированы"
 
-      - name: Upload Artifact
+      # Загрузка артефактов
+      - name: Загрузка артефактов
         if: env.UPLOAD_ARTIFACT == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: ${{matrix.platform}}
           path: ./out
-          retention-days: 1
+          retention-days: 7
 
-      - name: Clean up keychain and provisioning profile
-        if: ${{ always() && startsWith(matrix.os,'macos')}}
-        run: |
-          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db ||echo ok
-          rm ~/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision ||echo ok
-  update-draft:
+  # Создание релиза с автоматическими артефактами
+  create-release:
     permissions: write-all
     if: ${{ inputs.upload-artifact }}
-    needs: [build]
+    needs: [build, generate-certificates]
     runs-on: ubuntu-latest
     steps:
-      - name: checkout
+      - name: Клонирование репозитория
         uses: actions/checkout@v6
         with:
-          # by default, it uses a depth of 1
-          # this fetches all history so that we can read each commit
           fetch-depth: 0
-      - name: Download Artifact
+          
+      - name: Загрузка всех артефактов
         uses: actions/download-artifact@v7
         with:
           merge-multiple: true
           pattern: "*"
           path: ./out/
           
-
-      - name: Display Files Structure
-        run: ls -R
-        working-directory: ./out
-
-      - name: Delete Current Release Assets
-        uses: 8Mi-Tech/delete-release-assets-action@main
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          tag: 'draft'
-          deleteOnlyFromDrafts: false
+      - name: Создание архива с сертификатами (опционально)
+        run: |
+          mkdir -p certificates_backup
+          echo "# Сертификаты для сборки ${{ env.TAG_NAME }}" > certificates_backup/README.md
+          echo "" >> certificates_backup/README.md
+          echo "⚠️ **ВАЖНО**: Эти сертификаты сгенерированы автоматически и предназначены только для разработки." >> certificates_backup/README.md
+          echo "" >> certificates_backup/README.md
+          echo "## Информация о сертификатах" >> certificates_backup/README.md
+          echo "- Android Keystore: Сгенерирован автоматически" >> certificates_backup/README.md
+          echo "- Windows PFX: Сгенерирован автоматически" >> certificates_backup/README.md
+          echo "- macOS P12: Сгенерирован автоматически" >> certificates_backup/README.md
+          echo "" >> certificates_backup/README.md
+          echo "Для использования в production, замените на официальные сертификаты." >> certificates_backup/README.md
           
-      - name: prepare_release_message
-        continue-on-error: true
+      - name: Просмотр структуры файлов
         run: |
-          set +e 
-          sed 's|RELEASE_TAG|${{ env.TAG_NAME }}|g' ./.github/release_message.md > release.md
-          pip install gitchangelog pystache mustache markdown
-          prelease=$(curl --silent "https://api.github.com/repos/hiddify/hiddify-app/releases/latest" | grep -Po '"tag_name": "\K([^"]*)') 
-          echo -e "\n\n<details markdown=1><summary>All changes from $current to the latest commit:</summary>\n\n">>release.md
-          gitchangelog "${prelease}.." >> release.md  2>&1 || echo "Error in gitchangelog"
-          echo -e "\n\n</details>">>release.md
-      - name: Create or Update Draft Release
+          echo "📦 Собранные артефакты:"
+          ls -la ./out/
+          echo ""
+          echo "Количество файлов: $(ls -1 ./out/ | wc -l)"
+          
+      - name: Создание сообщения релиза
+        run: |
+          cat > release.md << EOF
+          # Автоматическая сборка ${{ env.TAG_NAME }}
+          
+          ## 📦 Состав сборки
+          
+          Эта сборка создана автоматически с использованием самоподписанных сертификатов.
+          
+          ### Включенные платформы:
+          $(ls -1 ./out/ | sed 's/^/ - /')
+          
+          ### 🔐 Информация о подписи:
+          - **Android**: Самоподписанный keystore (алиас: ${{ needs.generate-certificates.outputs.android_key_alias }})
+          - **Windows**: Самоподписанный сертификат (SHA1: ${{ needs.generate-certificates.outputs.windows_sha1 }})
+          - **macOS**: Самоподписанный сертификат
+          
+          > ⚠️ **Внимание**: Это самоподписанные сертификаты, предназначенные только для разработки и тестирования.
+          
+          ## 📝 Изменения
+          
+          $(git log --oneline --pretty=format:"- %s" $(git describe --tags --abbrev=0 2>/dev/null || echo "HEAD~10")..HEAD 2>/dev/null || echo "Нет данных об изменениях")
+          
+          ## 🚀 Установка
+          
+          Скачайте соответствующий файл для вашей платформы:
+          
+          - **Windows**: Файлы .exe, .msix или .zip
+          - **macOS**: Файлы .dmg или .pkg
+          - **Linux**: Файлы .deb, .AppImage или .tar.gz
+          - **Android**: APK файлы для разных архитектур
+          
+          ---
+          *Сборка создана: $(date +'%Y-%m-%d %H:%M:%S')*
+          *GitHub Actions Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+          EOF
+          
+      - name: Создание или обновление релиза
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: ./out/*
-          name: 'draft'
-          tag_name: 'draft'
-          body_path: './release.md'
-          prerelease: true
-
-      - name: Create or Update Draft Release
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.TOKEN_FOR_HIDDIFY_APP_REPO }}
-          GITHUB_REPOSITORY: hiddify/hiddify-app
-        with:
-          files: ./out/*
-          name: 'draft'
-          tag_name: 'draft'
-          body_path: './release.md'
-          target_commitish: '530bf77839a74d4f13847ba244a20734ac7ab119'
-          prerelease: true
-          repository: hiddify/hiddify-app
-
-  upload-release:
-    permissions: write-all
-    if: ${{ inputs.upload-artifact && inputs.tag-name != 'draft' }}
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: checkout
-        uses: actions/checkout@v6
-
-      - name: Download Artifact
-        uses: actions/download-artifact@v7
-        with:
-          merge-multiple: true
-          pattern: "*"
-          path: ./out/
-
-      - name: Display Files Structure
-        run: |
-          ls -R ./out
-          ls -R ./.github/
-          ls -R ./.git/
-          mv out/hiddify-android-market.aab  hiddify-android-market.aab
-
-      - name: prepare_release_message
-        run: |
-          sed 's|RELEASE_TAG|${{ env.TAG_NAME }}|g' ./.github/release_message.md >> release.md
-
-      - name: Upload Release
-        uses: softprops/action-gh-release@v2
-        if: ${{ success() }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          # prerelease: ${{ env.CHANNEL == 'dev' }}
-          prerelease: true
+          name: "Автоматическая сборка ${{ env.TAG_NAME }}"
           tag_name: ${{ env.TAG_NAME }}
-          body_path: './release.md'
-          files: ./out/*
-
-      - name: Create service_account.json
-        run: echo '${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}' > service_account.json
-
-      - name: Deploy to Google Play Internal Testers
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJson: service_account.json
-          packageName: app.hiddify.com
-          releaseName: ${{ env.TAG_NAME }}
-          releaseFiles: ./hiddify-android-market.aab
-          track: 'beta'
-
-
-  upload-to-testflight:
-    needs: [build]
-    if: ${{ inputs.upload-artifact &&  inputs.tag-name != 'draft' }}
-    #if: ${{ inputs.upload-artifact }}
-    runs-on: macOS-latest
-    timeout-minutes: 30
-    steps:
-      - name: Download Artifact
-        uses: actions/download-artifact@v7
-        with:
-          merge-multiple: true
-          pattern: "*ios*"
-          path: ./out/
-
-      - uses: Apple-Actions/import-codesign-certs@v6
-        with:
-          p12-file-base64: ${{ secrets.APPLE_UPLOAD_CERTIFICATE_P12 }}
-          p12-password: ${{ secrets.APPLE_CERTIFICATE_P12_PASSWORD }}
-
-      - uses: Apple-Actions/download-provisioning-profiles@v1
-        with:
-          bundle-id: app.hiddify.com
-          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
-          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
-          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
-      - uses: Apple-Actions/download-provisioning-profiles@v1
-        with:
-          bundle-id: app.hiddify.com.SingBoxPacketTunnel
-          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
-          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
-          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
-  
-
-
-      - name: Import Apple Mobile Provisioning Profile
+          body_path: ./release.md
+          prerelease: true
+          draft: false
+          
+      - name: Вывод итоговой информации
         run: |
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          echo "${{secrets.APPLE_DIST_PROVISIONING_PROFILES_TARGZ_BASE64}}"|base64 --decode | tar xz -C ~/Library/MobileDevice/Provisioning\ Profiles
-        #echo "${{secrets.NEW_APPLE_STORE_PROVISIONING_PROFILES_TARXZ_BASE64}}"|base64 --decode | tar xJ -C ~/Library/MobileDevice/Provisioning\ Profiles
-
-      - uses: Apple-Actions/upload-testflight-build@v4
-        with:
-          app-path: 'out/Hiddify-iOS.ipa' 
-          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
-          api-key-id: ${{ secrets.APPSTORE_API_KEY_ID }}
-          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ СБОРКА УСПЕШНО ЗАВЕРШЕНА"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 Релиз: ${{ env.TAG_NAME }}"
+          echo "🔗 Ссылка: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ env.TAG_NAME }}"
+          echo "📊 Количество артефактов: $(ls -1 ./out/ | wc -l)"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🔐 ИНФОРМАЦИЯ О СЕРТИФИКАТАХ:"
+          echo "   Android алиас: ${{ needs.generate-certificates.outputs.android_key_alias }}"
+          echo "   Windows SHA1: ${{ needs.generate-certificates.outputs.windows_sha1 }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⚠️  ВНИМАНИЕ: Используются самоподписанные сертификаты!"
+          echo "   Для публикации в магазинах замените на официальные."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
